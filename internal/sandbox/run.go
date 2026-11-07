@@ -12,6 +12,20 @@ import (
 	"time"
 )
 
+// execOutcome is the result of one execute() attempt.
+type execOutcome struct {
+	exitCode                         int
+	signal                           string
+	timedOut                         bool
+	peakKB                           int64
+	peakSource                       string
+	oomKills                         int
+	duration                         time.Duration
+	outputBytes                      int64
+	stdoutTruncated, stderrTruncated bool
+	startErr                         error
+}
+
 // Run executes one sandboxed run and returns the result plus the process
 // exit code lease itself should exit with (0, 1, 2 or 3).
 func Run(o RunOptions) (RunResult, int) {
@@ -113,6 +127,15 @@ func Run(o RunOptions) (RunResult, int) {
 	lease.Systemd = useSystemd
 	if !useSystemd {
 		lease.SystemdReason = "systemd-run --user --scope could not start (no user bus in this environment); ran bwrap directly with lease-enforced TTL"
+		lease.LimitsEnforced = false
+		lease.LimitsReason = "systemd-run --user unavailable: MemoryMax/CPUQuota cannot be enforced (lease still isolates filesystem and network)"
+	} else {
+		// systemd accepted the properties, but that is not enforcement:
+		// the kernel only enforces them when the user cgroup has the
+		// memory/cpu controllers delegated. Record what is actually true.
+		memOK, cpuOK, reason := limitsEnforced()
+		lease.LimitsEnforced = memOK && cpuOK
+		lease.LimitsReason = reason
 	}
 	_ = writeLeaseJSON(leasePath, lease)
 
@@ -121,7 +144,7 @@ func Run(o RunOptions) (RunResult, int) {
 
 	// execute runs one attempt. It (re)creates the log files, so a retry
 	// starts with clean logs.
-	execute := func(useProc bool) (exitCode int, signal string, timedOut bool, peakKB int64, duration time.Duration, outputBytes int64, startErr error) {
+	execute := func(useProc bool) execOutcome {
 		bwrapArgs := buildBwrapArgs(o, leaseDir, toolAbs, inputsAbs, id, useProc)
 		var outer []string
 		if useSystemd {
@@ -131,12 +154,12 @@ func Run(o RunOptions) (RunResult, int) {
 		}
 		stdoutFile, err := os.Create(stdoutPath)
 		if err != nil {
-			return 0, "", false, 0, 0, 0, fmt.Errorf("cannot create stdout log: %w", err)
+			return execOutcome{startErr: fmt.Errorf("cannot create stdout log: %w", err)}
 		}
 		stderrFile, err := os.Create(stderrPath)
 		if err != nil {
 			stdoutFile.Close()
-			return 0, "", false, 0, 0, 0, fmt.Errorf("cannot create stderr log: %w", err)
+			return execOutcome{startErr: fmt.Errorf("cannot create stderr log: %w", err)}
 		}
 		outW := &cappedWriter{f: stdoutFile, limit: MaxLogBytes}
 		errW := &cappedWriter{f: stderrFile, limit: MaxLogBytes}
@@ -155,7 +178,7 @@ func Run(o RunOptions) (RunResult, int) {
 		if err := cmd.Start(); err != nil {
 			stdoutFile.Close()
 			stderrFile.Close()
-			return 0, "", false, 0, 0, 0, fmt.Errorf("could not start the sandbox: %w", err)
+			return execOutcome{startErr: fmt.Errorf("could not start the sandbox: %w", err)}
 		}
 		lease.PID = cmd.Process.Pid
 		if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
@@ -165,9 +188,15 @@ func Run(o RunOptions) (RunResult, int) {
 		}
 		_ = writeLeaseJSON(leasePath, lease)
 
+		// Peak memory: sample the tool process tree's VmHWM while it runs.
+		// (The old code reported the launcher's rusage, which is bwrap's
+		// own memory, not the tool's. See peak.go.)
+		poller := newPeakPoller(cmd.Process.Pid)
+
 		waitErr := cmd.Wait()
-		duration = time.Since(start)
-		timedOut = ctx.Err() == context.DeadlineExceeded
+		polledKB := poller.stopAndRead()
+		duration := time.Since(start)
+		timedOut := ctx.Err() == context.DeadlineExceeded
 		if timedOut {
 			KillGroup(lease.PGID)
 		} else if waitErr == nil {
@@ -175,67 +204,82 @@ func Run(o RunOptions) (RunResult, int) {
 			KillGroup(lease.PGID)
 		}
 
-		exitCode = 0
+		out := execOutcome{duration: duration, timedOut: timedOut}
 		if waitErr != nil {
 			if ee, ok := waitErr.(*exec.ExitError); ok {
 				if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
 					if ws.Signaled() {
-						signal = ws.Signal().String()
-						exitCode = -1
+						out.signal = ws.Signal().String()
+						out.exitCode = -1
 					} else {
-						exitCode = ws.ExitStatus()
+						out.exitCode = ws.ExitStatus()
 					}
 				} else {
-					exitCode = 1
+					out.exitCode = 1
 				}
 			} else {
-				exitCode = 1
+				out.exitCode = 1
 			}
 		}
 		// systemd RuntimeMaxSec can kill the scope at the TTL even if our
 		// context fired a moment later; treat "ran for ~TTL and died by
 		// signal" as a timeout.
-		if !timedOut && signal != "" && duration >= time.Duration(o.TTL)*time.Second-time.Second {
-			timedOut = true
+		if !out.timedOut && out.signal != "" && duration >= time.Duration(o.TTL)*time.Second-time.Second {
+			out.timedOut = true
 		}
-		// Peak memory: rusage of the launcher is only meaningful on the
-		// direct bwrap path; report it when available, 0 otherwise.
-		if ps := cmd.ProcessState; ps != nil {
-			if ru, ok := ps.Sys().(*syscall.Rusage); ok {
-				peakKB = ru.Maxrss // KB on Linux
+		// Peak memory, best source first: the scope cgroup's memory.peak
+		// when it is visible on this host, else the poller's sampled max.
+		if useSystemd {
+			cg := scopeCgroupPath(id)
+			if cgPeak := cgroupPeakKB(cg); cgPeak > 0 {
+				out.peakKB = cgPeak
+				out.peakSource = "cgroup"
+			}
+			out.oomKills = cgroupOOMKills(cg)
+		}
+		if out.peakKB == 0 {
+			out.peakKB = polledKB
+			if polledKB > 0 {
+				out.peakSource = "proc-poll"
 			}
 		}
-		outputBytes = outW.written + errW.written
+		out.outputBytes = outW.written + errW.written
+		out.stdoutTruncated = outW.truncated
+		out.stderrTruncated = errW.truncated
 		stdoutFile.Close()
 		stderrFile.Close()
-		return exitCode, signal, timedOut, peakKB, duration, outputBytes, nil
+		return out
 	}
 
-	exitCode, signal, timedOut, peakKB, duration, outputBytes, startErr := execute(true)
-	if startErr != nil {
-		return fail("LEASE_NOT_STARTED", startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
+	out := execute(true)
+	if out.startErr != nil {
+		return fail("LEASE_NOT_STARTED", out.startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
 	}
 	// Mounting a fresh proc is impossible on some hosts (this cloud VM
 	// included): bwrap fails fast with "Can't mount proc". Retry once
 	// with an empty /proc directory instead of a proc mount.
-	if exitCode != 0 && !timedOut {
+	if out.exitCode != 0 && !out.timedOut {
 		if b, err := os.ReadFile(stderrPath); err == nil && strings.Contains(string(b), "Can't mount proc") {
 			lease.ProcFallback = true
 			lease.ProcReason = "mounting a fresh /proc is not permitted on this host; the sandbox uses an empty /proc instead"
 			_ = writeLeaseJSON(leasePath, lease)
-			exitCode, signal, timedOut, peakKB, duration, outputBytes, startErr = execute(false)
-			if startErr != nil {
-				return fail("LEASE_NOT_STARTED", startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
+			out = execute(false)
+			if out.startErr != nil {
+				return fail("LEASE_NOT_STARTED", out.startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
 			}
 		}
 	}
 
 	lease.Ended = time.Now()
-	lease.TimedOut = timedOut
-	lease.Signal = signal
-	ec := exitCode
+	lease.TimedOut = out.timedOut
+	lease.Signal = out.signal
+	ec := out.exitCode
 	lease.ExitCode = &ec
-	lease.PeakMemoryKB = peakKB
+	lease.PeakMemoryKB = out.peakKB
+	lease.PeakSource = out.peakSource
+	lease.OOMKilled = out.oomKills > 0
+	lease.StdoutTruncated = out.stdoutTruncated
+	lease.StderrTruncated = out.stderrTruncated
 	_ = writeLeaseJSON(leasePath, lease)
 
 	// Copy the sandbox /out to the host --out.
@@ -247,14 +291,14 @@ func Run(o RunOptions) (RunResult, int) {
 	}
 
 	res := RunResult{
-		Lease: id, ExitCode: exitCode, Signal: signal, Out: outAbs,
+		Lease: id, ExitCode: out.exitCode, Signal: out.signal, Out: outAbs,
 		Stdout: stdoutPath, Stderr: stderrPath,
-		DurationMs: duration.Milliseconds(), TimedOut: timedOut,
+		DurationMs: out.duration.Milliseconds(), TimedOut: out.timedOut,
 	}
-	if timedOut {
+	if out.timedOut {
 		res.OK = false
 		res.Error = &ErrorObj{Code: "TIMED_OUT", Blocked: fmt.Sprintf("child ran longer than --ttl %ds and was killed", o.TTL), Fix: "Pass a larger --ttl, or make the tool faster.", IfThatFails: "Run the tool outside lease to see why it is slow."}
-		emitTelemetry(false, inputBytes, outputBytes, duration)
+		emitTelemetry(false, inputBytes, out.outputBytes, out.duration)
 		if o.JSON {
 			b, _ := json.Marshal(res)
 			fmt.Println(string(b))
@@ -265,10 +309,24 @@ func Run(o RunOptions) (RunResult, int) {
 		}
 		return res, 3
 	}
-	if exitCode != 0 {
+	if out.oomKills > 0 {
 		res.OK = false
-		res.Error = &ErrorObj{Code: "CHILD_EXIT", Blocked: fmt.Sprintf("child exited with code %d (signal %q)", exitCode, signal), Fix: "Run the tool outside lease with the same inputs to reproduce the failure.", IfThatFails: "Check the stderr log for the tool's own error message."}
-		emitTelemetry(false, inputBytes, outputBytes, duration)
+		res.Error = &ErrorObj{Code: "CHILD_OOM", Blocked: fmt.Sprintf("child was killed by the kernel OOM killer inside its cgroup (limit --memory %s)", o.Memory), Fix: "Pass a larger --memory, or make the tool use less memory.", IfThatFails: "Run the tool outside lease and watch its memory use."}
+		emitTelemetry(false, inputBytes, out.outputBytes, out.duration)
+		if o.JSON {
+			b, _ := json.Marshal(res)
+			fmt.Println(string(b))
+		} else {
+			printChildStdout(stdoutPath)
+			f := NewError("CHILD_OOM", res.Error.Blocked, res.Error.Fix, res.Error.IfThatFails)
+			PrintFailure(f)
+		}
+		return res, 1
+	}
+	if out.exitCode != 0 {
+		res.OK = false
+		res.Error = &ErrorObj{Code: "CHILD_EXIT", Blocked: fmt.Sprintf("child exited with code %d (signal %q)", out.exitCode, out.signal), Fix: "Run the tool outside lease with the same inputs to reproduce the failure.", IfThatFails: "Check the stderr log for the tool's own error message."}
+		emitTelemetry(false, inputBytes, out.outputBytes, out.duration)
 		if o.JSON {
 			b, _ := json.Marshal(res)
 			fmt.Println(string(b))
@@ -280,7 +338,7 @@ func Run(o RunOptions) (RunResult, int) {
 		return res, 1
 	}
 	res.OK = true
-	emitTelemetry(true, inputBytes, outputBytes, duration)
+	emitTelemetry(true, inputBytes, out.outputBytes, out.duration)
 	if o.JSON {
 		b, _ := json.Marshal(res)
 		fmt.Println(string(b))

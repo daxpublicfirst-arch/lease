@@ -49,6 +49,23 @@ func Doctor(root string) DoctorResult {
 	nsOK, nsDetail := checkUserNS()
 	checks = append(checks, Check{Name: "user-namespaces", OK: nsOK, Detail: nsDetail})
 
+	// Resource limits: accepting MemoryMax/CPUQuota is not enforcement.
+	// The kernel only enforces them when the user cgroup has the memory
+	// and cpu controllers delegated. Not fatal — the sandbox still
+	// isolates filesystem and network — but the gap must be visible,
+	// not silent.
+	if systemdAvailable() {
+		memOK, cpuOK, reason := limitsEnforced()
+		switch {
+		case memOK && cpuOK:
+			checks = append(checks, Check{Name: "resource-limits", OK: true, Detail: "MemoryMax/CPUQuota will be enforced (cgroup memory and cpu controllers delegated to the user manager)"})
+		default:
+			checks = append(checks, Check{Name: "resource-limits", OK: true, Detail: "warning: " + reason})
+		}
+	} else {
+		checks = append(checks, Check{Name: "resource-limits", OK: true, Detail: "warning: no user systemd bus here; MemoryMax/CPUQuota cannot be enforced, lease still isolates filesystem and network"})
+	}
+
 	// /proc: mounting a fresh proc is impossible on some hosts (this cloud
 	// VM included). Not fatal — Run retries with an empty /proc.
 	if procOK() {

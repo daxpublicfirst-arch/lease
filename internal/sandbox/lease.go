@@ -59,26 +59,39 @@ type Limits struct {
 
 // Lease is the on-disk record written to <root>/<id>/lease.json.
 type Lease struct {
-	ID            string    `json:"id"`
-	Tool          string    `json:"tool"`
-	Inputs        []string  `json:"inputs"`
-	Out           string    `json:"out"`
-	Root          string    `json:"root"`
-	PID           int       `json:"pid"`
-	PGID          int       `json:"pgid"`
-	Start         time.Time `json:"start"`
-	Ended         time.Time `json:"ended,omitempty"`
-	TTL           int       `json:"ttl"`
-	Limits        Limits    `json:"limits"`
-	Network       string    `json:"network"`
-	ExitCode      *int      `json:"exit_code,omitempty"`
-	Signal        string    `json:"signal,omitempty"`
-	TimedOut      bool      `json:"timed_out"`
-	PeakMemoryKB  int64     `json:"peak_memory_kb,omitempty"`
-	Systemd       bool      `json:"systemd"`
-	SystemdReason string    `json:"systemd_reason,omitempty"`
-	ProcFallback  bool      `json:"proc_fallback,omitempty"`
-	ProcReason    string    `json:"proc_reason,omitempty"`
+	ID           string    `json:"id"`
+	Tool         string    `json:"tool"`
+	Inputs       []string  `json:"inputs"`
+	Out          string    `json:"out"`
+	Root         string    `json:"root"`
+	PID          int       `json:"pid"`
+	PGID         int       `json:"pgid"`
+	Start        time.Time `json:"start"`
+	Ended        time.Time `json:"ended,omitempty"`
+	TTL          int       `json:"ttl"`
+	Limits       Limits    `json:"limits"`
+	Network      string    `json:"network"`
+	ExitCode     *int      `json:"exit_code,omitempty"`
+	Signal       string    `json:"signal,omitempty"`
+	TimedOut     bool      `json:"timed_out"`
+	PeakMemoryKB int64     `json:"peak_memory_kb,omitempty"`
+	// PeakSource is "cgroup" when the number came from the scope cgroup's
+	// memory.peak, "proc-poll" when it came from sampling /proc VmHWM.
+	// The cgroup number counts page cache too; the poller number is the
+	// highest single process's peak RSS sampled every 25 ms.
+	PeakSource string `json:"peak_source,omitempty"`
+	// LimitsEnforced is true only when the kernel will really enforce
+	// MemoryMax/CPUQuota for this run (systemd path + delegated cgroup
+	// controllers). See limitsEnforced in systemd.go.
+	LimitsEnforced  bool   `json:"limits_enforced"`
+	LimitsReason    string `json:"limits_reason,omitempty"`
+	OOMKilled       bool   `json:"oom_killed,omitempty"`
+	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
+	Systemd         bool   `json:"systemd"`
+	SystemdReason   string `json:"systemd_reason,omitempty"`
+	ProcFallback    bool   `json:"proc_fallback,omitempty"`
+	ProcReason      string `json:"proc_reason,omitempty"`
 }
 
 // LeaseDir returns <root>/<id>.

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,13 +66,82 @@ func TestSystemdArgsUseRuntimeMaxSec(t *testing.T) {
 	o := RunOptions{TTL: 60, Memory: "2G", CPUs: 2, Network: "none"}
 	args := buildSystemdArgs(o, "abc", []string{"bwrap", "--ro-bind", "/usr", "/usr"})
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"RuntimeMaxSec=60s", "MemoryMax=2G", "CPUQuota=200%", "TasksMax=64", "NoNewPrivileges=yes", "PrivateNetwork=yes", "systemd-run --user --scope"} {
+	for _, want := range []string{"RuntimeMaxSec=60s", "MemoryMax=2G", "CPUQuota=200%", "TasksMax=64", "--quiet", "systemd-run --user --scope"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("systemd args missing %q in %q", want, joined)
 		}
 	}
 	if strings.Contains(joined, "RuntimeMax=60") {
 		t.Errorf("must use RuntimeMaxSec, not RuntimeMax: %q", joined)
+	}
+	// Scopes only accept resource-control properties. NoNewPrivileges and
+	// PrivateNetwork are systemd.exec properties: systemd rejects them
+	// with "Unknown assignment", so including them broke every run on
+	// any host that actually has a user bus.
+	for _, forbidden := range []string{"NoNewPrivileges", "PrivateNetwork"} {
+		if strings.Contains(joined, forbidden) {
+			t.Errorf("scope args must not contain %q: %q", forbidden, joined)
+		}
+	}
+}
+
+func TestReadVmHWMKB(t *testing.T) {
+	if h := readVmHWMKB(os.Getpid()); h <= 0 {
+		t.Fatalf("own VmHWM must be > 0, got %d", h)
+	}
+	if h := readVmHWMKB(999999); h != 0 {
+		t.Fatalf("missing pid must read 0, got %d", h)
+	}
+}
+
+func TestDescendantPIDsFindsChild(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skip("sleep not available")
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	found := false
+	for _, pid := range descendantPIDs(os.Getpid()) {
+		if pid == cmd.Process.Pid {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("descendantPIDs must find the sleep child %d", cmd.Process.Pid)
+	}
+}
+
+func TestPeakPollerSamplesChild(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skip("sleep not available")
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	p := newPeakPoller(cmd.Process.Pid)
+	time.Sleep(100 * time.Millisecond)
+	if max := p.stopAndRead(); max <= 0 {
+		t.Fatalf("poller must see a positive VmHWM for a live child, got %d", max)
+	}
+}
+
+func TestCappedWriterTruncates(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	w := &cappedWriter{f: f, limit: 10}
+	if _, err := w.Write([]byte("0123456789ABCDEF")); err != nil {
+		t.Fatal(err)
+	}
+	if !w.truncated || w.written != 10 {
+		t.Fatalf("writer must truncate at 10 bytes, got written=%d truncated=%v", w.written, w.truncated)
+	}
+	if _, err := w.Write([]byte("more")); err != nil {
+		t.Fatal(err)
+	}
+	if w.written != 10 {
+		t.Fatalf("writer must stay at 10 bytes after truncation, got %d", w.written)
 	}
 }
 
