@@ -6,9 +6,13 @@ BINARY := lease
 VERSION := 0.1.0
 DIST := dist
 
-.PHONY: all build test vet self-test doctor clean dist sha256
+.PHONY: all build test vet check self-test doctor clean dist sha256
 
 all: build
+
+# check: the full local gate — formatting, vet, unit tests, sandbox
+# self-test and doctor. Run it before reporting a change done.
+check: vet test self-test doctor
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/$(BINARY) ./cmd/lease

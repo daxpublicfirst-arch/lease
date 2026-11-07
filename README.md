@@ -16,6 +16,16 @@ keys, no prompt files, no network from `lease` itself. No daemon, no root.
 - Protocol: `arabica-plugin-v1` (see `plugin.toml`)
 - License: MIT
 
+## Documentation
+
+- [docs/DESIGN.md](docs/DESIGN.md) — goals, non-goals, threat model, contracts.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — layout, data flow, sandbox filesystem, process model.
+- [docs/DECISIONS.md](docs/DECISIONS.md) — the reasoning behind every decision (19 ADRs), with alternatives, trade-offs, and sources.
+- [docs/TESTING.md](docs/TESTING.md) — how to verify lease, what has been verified, and what still needs a different host.
+
+If you are reading a fresh clone and wondering *why* something is built
+the way it is, start with `docs/DECISIONS.md`.
+
 ## Example
 
 ```sh
@@ -52,12 +62,15 @@ make build
    string), plus `<root>/<id>/out`, `<root>/<id>/home`, and
    `<root>/<id>/lease.json` (tool, inputs, out, pid, start, ttl, limits,
    network).
-2. Starts the child under `systemd-run --user --scope` with
+2. Starts the child under `systemd-run --user --scope --quiet` with
    `MemoryMax=<memory>`, `CPUQuota=<cpus*100>%`, `RuntimeMaxSec=<ttl>`,
-   `TasksMax=64`, `NoNewPrivileges=yes`, and `PrivateNetwork=yes` for
-   `--network none`. For `--network localhost` the net namespace is still
-   unshared, but loopback is brought up inside the sandbox, so the child
-   can talk to itself on `127.0.0.1` and nothing else.
+   and `TasksMax=64`. Only resource-control properties are valid on a
+   scope: `NoNewPrivileges=yes` and `PrivateNetwork=yes` are rejected
+   by systemd with "Unknown assignment" (see research note 13), and the
+   isolation they were meant to provide already comes from bwrap.
+   For `--network localhost` the net namespace is still unshared, but
+   loopback is brought up inside the sandbox, so the child can talk to
+   itself on `127.0.0.1` and nothing else.
 3. Inside that, `bwrap` with `--unshare-user --uid 0 --gid 0` (portable
    rootless mode), `--ro-bind /usr /usr`, a minimal `/etc` (tmpfs with
    `ld.so.cache`, `ssl`, `resolv.conf`, `hosts` when present), each input
@@ -75,10 +88,12 @@ make build
    `LEASE_INPUT_<n>=/input/<n>`, and each `--env KEY=VALUE`. The host
    environment is never passed through.
 5. Stdout/stderr are captured to `<root>/<id>/stdout.log` and
-   `stderr.log`, capped at 10 MB each. On exit the process group is
-   killed, `lease.json` gains `ended`, `exit_code`, `signal`,
-   `peak_memory_kb` (when available), and the sandbox `/out` is copied to
-   the host `--out`.
+   `stderr.log`, capped at 10 MB each (the cap is recorded as
+   `stdout_truncated`/`stderr_truncated` in `lease.json`). On exit the
+   process group is killed, `lease.json` gains `ended`, `exit_code`,
+   `signal`, `peak_memory_kb` and `peak_source`, `limits_enforced` (+
+   `limits_reason`), `oom_killed` when applicable, and the sandbox
+   `/out` is copied to the host `--out`.
 6. With `--json` it prints one final JSON object; without it, it prints
    the child's stdout. One telemetry line goes to stderr per run.
 
@@ -88,9 +103,10 @@ make build
  "duration_ms":123,"timed_out":false}
 ```
 
-Exit codes: `0` success, `1` the child exited non-zero, `2` usage or
-input error, `3` tool failure (missing `bwrap`/`systemd-run`, a lease
-that could not start, or a child killed by its TTL). Failures print one
+Exit codes: `0` success, `1` the child exited non-zero (or was
+OOM-killed, `CHILD_OOM`), `2` usage or input error, `3` tool failure
+(missing `bwrap`/`systemd-run`, a lease that could not start, a child
+killed by its TTL, or a log that could not be written). Failures print one
 JSON object: `{"ok":false,"error":{"code":"...","blocked":"...","fix":"...","if_that_fails":"..."}}`.
 
 ## What the child can see
@@ -136,6 +152,7 @@ sudo apt-get install -y bubblewrap
 # Go: https://go.dev/dl/ (or your package manager)
 
 make build        # bin/lease
+make check        # full local gate: gofmt + vet + unit tests + self-test + doctor
 make test         # unit tests (no sandbox needed)
 make vet          # go vet + gofmt check
 make self-test    # full sandbox security tests
@@ -170,10 +187,12 @@ assumed:
    into it, and `--remount-ro /etc` (a plain `--dir` cannot be
    remounted at all — bwrap fails with "Unable to find /etc in mount
    table").
-6. **`PrivateNetwork=yes` is not loopback-only.** It gives the child no
-   network at all, loopback down. For `--network localhost`, `lease`
-   omits `PrivateNetwork`, keeps `bwrap --unshare-net`, and brings `lo`
-   up inside the sandbox (`ip link set lo up`) before execing the tool.
+6. **`PrivateNetwork=yes` is not loopback-only — and not valid on a
+   scope at all.** It gives the child no network at all, loopback down.
+   Worse, systemd rejects it on scopes ("Unknown assignment", see note
+   13). For `--network localhost`, `lease` omits it, keeps
+   `bwrap --unshare-net`, and brings `lo` up inside the sandbox
+   (`ip link set lo up`) before execing the tool.
 7. **No user systemd bus in this cloud VM.** `systemd-run --user`
    fails here (`systemctl --user`: "No medium found") even though
    systemd is PID 1 and `systemd-run` exists. `lease` probes
@@ -212,15 +231,54 @@ assumed:
     tool script checked in without the exec bit (the GitHub API stores
     files as 0644) would fail with "Permission denied", so `lease`
     runs non-executable tools under `/bin/sh`.
+13. **Scope properties: `NoNewPrivileges` and `PrivateNetwork` broke
+    every systemd-path run.** The first build was only ever tested on
+    a VM without a user bus, so every run took the direct-`bwrap`
+    fallback and the systemd properties were never executed. On
+    2026-11-08 a user bus was started in the VM (`dbus-daemon --system`
+    + `systemctl start user@0.service`) and the systemd path ran for
+    the first time — every run failed with "Unknown assignment:
+    NoNewPrivileges=yes". Scopes only accept resource-control
+    properties; a scope does not exec anything, so `systemd.exec`
+    properties cannot apply to it. Both were removed; the isolation
+    they were meant to provide already comes from bwrap (see note 6
+    and `docs/DECISIONS.md` ADR-05). The same session found that
+    `systemd-run` prints "Running as unit: ..." to stderr, which
+    polluted the child's stderr log — `--quiet` is now passed.
+14. **Accepting a limit is not enforcing it.** `systemd-run` happily
+    accepts `MemoryMax=50M` on a host whose cgroup view has no memory
+    controller — and the limit then does nothing (verified: a 200 MB
+    allocation succeeded under `MemoryMax=50M` in this VM). `lease`
+    now checks whether the user manager's cgroup has the `memory.max`
+    / `cpu.max` control files and records `limits_enforced` +
+    `limits_reason` in `lease.json` and a `resource-limits` check in
+    `doctor`. `prlimit` was considered as a fallback enforcer and
+    rejected: `RLIMIT_AS` counts virtual address space and breaks Go
+    tools that reserve large virtual arenas.
+15. **Peak memory reported the wrong process.** The first version
+    reported the launcher's rusage — bwrap's parent, not the tool.
+    `lease` now reads the scope cgroup's `memory.peak` when the cgroup
+    is visible, else samples the tool tree's `VmHWM` from `/proc`
+    every 25 ms, and records which source was used (`peak_source`).
+    Verified: a tool allocating 200 MB reported ~215 000 KB.
+    A child OOM-killed inside its cgroup is now reported as the
+    distinct error `CHILD_OOM` instead of a bare `CHILD_EXIT`.
+16. **A full disk blamed the child.** When `/tmp` (a 512 MB tmpfs,
+    97% full) ran out of space mid-run, the log write failed, the
+    child died with SIGPIPE (exit 141), and `lease` reported
+    `CHILD_EXIT`. Log write errors are now reported as `OUTPUT_ERROR`
+    (exit 3). Keep lease roots off a nearly-full `/tmp` for large
+    outputs.
 
 ## Layout
 
 ```text
 go.mod
 cmd/lease/main.go
-internal/sandbox/{run.go,bwrap.go,systemd.go,lease.go,gc.go,doctor.go,selftest.go}
+internal/sandbox/{run.go,bwrap.go,systemd.go,peak.go,lease.go,gc.go,doctor.go,selftest.go}
 schema/{request,response,error,telemetry}.json
 fixtures/{tool-echo.sh,input.log,expected.json}
+docs/{DESIGN,ARCHITECTURE,DECISIONS,TESTING}.md
 plugin.toml
 README.md
 LICENSE
@@ -231,9 +289,17 @@ Makefile
 
 ## Known limitations
 
-- `peak_memory_kb` is only available on the direct-`bwrap` path (from
-  the launcher's rusage); under `systemd-run` the scope's cgroup is
-  gone by the time the run ends, so it reports 0.
+- **Resource limits are only enforced where the kernel can enforce
+  them.** `lease` sets `MemoryMax`/`CPUQuota` on every systemd-path
+  run, but on hosts without cgroup controllers delegated to the user
+  manager (containers included) the kernel ignores them. `lease.json`
+  says so (`limits_enforced:false` + reason) and `doctor` reports it
+  — see research note 14. Filesystem/network isolation and the TTL
+  still apply everywhere.
+- `peak_memory_kb` is the cgroup `memory.peak` when the scope cgroup is
+  visible, else the highest single process's `VmHWM` sampled every
+  25 ms. The poller can miss a tool that allocates and exits within one
+  sample interval, and the cgroup number counts page cache.
 - `--network localhost` needs the `ip` binary under `/usr` inside the
   sandbox; without it, loopback stays down and the run still proceeds.
 - `lease` enforces the TTL itself and uses `RuntimeMaxSec` as a
