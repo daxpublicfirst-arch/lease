@@ -58,12 +58,15 @@ make build
    `--network none`. For `--network localhost` the net namespace is still
    unshared, but loopback is brought up inside the sandbox, so the child
    can talk to itself on `127.0.0.1` and nothing else.
-3. Inside that, `bwrap` with `--ro-bind /usr /usr`, a minimal `/etc`
-   (`ld.so.cache`, `ssl`, `resolv.conf`, `hosts` when present), each input
-   as `--ro-bind <input> /input/<n>`, `--bind <root>/<id>/out /out`,
-   `--bind <root>/<id>/home /home`, `--tmpfs /tmp`, `--tmpfs /run`,
-   `--proc /proc`, `--dev /dev`, `--unshare-pid`, `--unshare-net`,
-   `--unshare-ipc`, `--unshare-uts`, `--die-with-parent`, `--new-session`.
+3. Inside that, `bwrap` with `--unshare-user --uid 0 --gid 0` (portable
+   rootless mode), `--ro-bind /usr /usr`, a minimal `/etc` (tmpfs with
+   `ld.so.cache`, `ssl`, `resolv.conf`, `hosts` when present), each input
+   as `--ro-bind <input> /input/<n>`, the tool as `--ro-bind <tool> /tool`,
+   `--bind <root>/<id>/out /out`, `--bind <root>/<id>/home /home`,
+   `--tmpfs /tmp`, `--tmpfs /run`, `--proc /proc` (or an empty `/proc`
+   dir where mounting one is not permitted — see below), `--dev /dev`,
+   `--unshare-pid`, `--unshare-net`, `--unshare-ipc`, `--unshare-uts`,
+   `--die-with-parent`, `--new-session`.
    `/etc` and `/` are remounted read-only after the binds, so the child
    cannot create `/etc/lease-test` or write anywhere except `/out`,
    `/home`, `/tmp` and `/run`.
@@ -163,9 +166,10 @@ assumed:
 5. **`/etc` was writable.** The prompt creates `/etc` with `--dir` and
    binds files into it, but a plain `--dir` is writable, so the child
    could create `/etc/lease-test` — the very thing security test 1
-   forbids. `lease` adds `--remount-ro /etc` and `--remount-ro /`
-   after the binds (`/out`, `/home`, `/tmp`, `/run` stay writable
-   because they are separate mounts).
+   forbids. `lease` mounts a tmpfs on `/etc`, binds the minimal files
+   into it, and `--remount-ro /etc` (a plain `--dir` cannot be
+   remounted at all — bwrap fails with "Unable to find /etc in mount
+   table").
 6. **`PrivateNetwork=yes` is not loopback-only.** It gives the child no
    network at all, loopback down. For `--network localhost`, `lease`
    omits `PrivateNetwork`, keeps `bwrap --unshare-net`, and brings `lo`
@@ -183,10 +187,31 @@ assumed:
    `<root>/<id>/out` for the child and reports `--out` as the result
    path. `lease` treats `<root>/<id>/out` as the sandbox `/out` and
    copies it to the host `--out` after the run, so both are true.
-9. **Tagging.** The release deliverable asks for a `v0.1.0` tag; the
-   tag is created from the release workflow / a maintainer's `git tag`
-   (see CHANGELOG). Binaries and `sha256sum.txt` are built by
-   `make dist sha256` and uploaded by CI.
+9. **Tagging / CI.** The release deliverable asks for a `v0.1.0` tag
+   and CI. The Muse GitHub App cannot create tags or releases (no such
+   tool in its catalogue) and cannot write `.github/workflows/ci.yml`
+   (403 — it lacks the `workflows` permission), so the CI file lives
+   in the local checkout only. Per the maintainer's preference, no
+   browser / web-UI step is used for the tag or release either — they
+   are out of scope unless explicitly asked for. Binaries and
+   `sha256sum.txt` are built by `make dist sha256` and uploaded by CI
+   once the workflow file is added from a maintainer checkout.
+10. **Loopback needs a user namespace.** Without `--unshare-user`,
+    bwrap's loopback setup fails in this VM ("Failed RTM_NEWADDR: No
+    child processes") because the container lacks `CAP_NET_ADMIN`.
+    `lease` always uses `--unshare-user --uid 0 --gid 0`.
+11. **A fresh `/proc` cannot be mounted in this VM.** Even plain
+    `unshare --user --map-root-user --pid --mount-proc` fails with
+    EPERM. `lease` first tries `--proc /proc` and, when bwrap fails
+    with "Can't mount proc", retries once with an empty `/proc`
+    directory (recorded as `proc_fallback` in `lease.json`). The child
+    sees no host processes either way.
+12. **Bind order matters, and so does the exec bit.** The `--ro-bind
+    <tool> /tool` must come before `--remount-ro /`, or bwrap cannot
+    create the `/tool` mount point ("Read-only file system"). And a
+    tool script checked in without the exec bit (the GitHub API stores
+    files as 0644) would fail with "Permission denied", so `lease`
+    runs non-executable tools under `/bin/sh`.
 
 ## Layout
 
