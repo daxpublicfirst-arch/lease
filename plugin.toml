@@ -1,0 +1,12 @@
+name = "lease"
+version = "0.1.0"
+kind = "cli"
+entry = "bin/lease"
+protocol = "arabica-plugin-v1"
+commands = ["run", "gc", "status", "doctor", "version"]
+about = "Run one CLI tool in a disposable sandbox with a time limit and a cleanup."
+example = "lease run --tool ./bin/logreduce --input ./test.log --out ./out --ttl 60 --network none --json -- reduce --kind vitest --log /input/0 --out /out --json"
+permissions = { read = ["--tool", "--input"], write = ["--out", "--root"], network = false }
+limits = { input_mb = 200, timeout_s = 60 }
+license = "MIT"
+source = "https://github.com/daxpublicfirst-arch/lease"

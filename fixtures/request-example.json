@@ -1,0 +1,1 @@
+{"args":{"argv":["reduce","--kind","vitest","--log","/input/0","--out","/out","--json"],"input":["/abs/log"],"network":"none","out":"/abs/out","root":"/abs/leases","tool":"/abs/bin/tool","ttl":60},"command":"run","protocol":"arabica-plugin-v1"}

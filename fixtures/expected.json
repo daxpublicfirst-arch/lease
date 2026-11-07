@@ -1,0 +1,1 @@
+{"expected_stdout_contains":["LEASE_OUT=/out","LEASE_INPUT_0=/input/0","hello from the fixture log"],"input":"input.log","tool":"tool-echo.sh"}
