@@ -49,6 +49,14 @@ func Doctor(root string) DoctorResult {
 	nsOK, nsDetail := checkUserNS()
 	checks = append(checks, Check{Name: "user-namespaces", OK: nsOK, Detail: nsDetail})
 
+	// /proc: mounting a fresh proc is impossible on some hosts (this cloud
+	// VM included). Not fatal — Run retries with an empty /proc.
+	if procOK() {
+		checks = append(checks, Check{Name: "proc-mount", OK: true, Detail: "bwrap can mount a fresh /proc"})
+	} else {
+		checks = append(checks, Check{Name: "proc-mount", OK: true, Detail: "warning: mounting a fresh /proc is not permitted here; lease will use an empty /proc instead"})
+	}
+
 	if root == "" {
 		root = "/tmp/arabica-lease"
 	}
@@ -83,6 +91,17 @@ func checkUserNS() (bool, string) {
 		return false, fmt.Sprintf("unshare --user failed: %v; enable unprivileged user namespaces", err)
 	}
 	return true, "unprivileged user namespaces work"
+}
+
+// procOK probes whether bwrap can mount a fresh /proc in this environment.
+func procOK() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bwrap",
+		"--unshare-user", "--uid", "0", "--gid", "0",
+		"--unshare-pid", "--ro-bind", "/usr", "/usr",
+		"--proc", "/proc", "/bin/true")
+	return cmd.Run() == nil
 }
 
 // PrintDoctor prints the doctor result, human-readable or JSON.

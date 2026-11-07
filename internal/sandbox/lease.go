@@ -77,6 +77,8 @@ type Lease struct {
 	PeakMemoryKB  int64     `json:"peak_memory_kb,omitempty"`
 	Systemd       bool      `json:"systemd"`
 	SystemdReason string    `json:"systemd_reason,omitempty"`
+	ProcFallback  bool      `json:"proc_fallback,omitempty"`
+	ProcReason    string    `json:"proc_reason,omitempty"`
 }
 
 // LeaseDir returns <root>/<id>.

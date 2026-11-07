@@ -92,7 +92,7 @@ func SelfTest(exe string, asJSON bool) SelfTestResult {
 		root, work := tempRoot(), tempRoot()
 		defer os.RemoveAll(root)
 		defer os.RemoveAll(work)
-		tool := writeTool(work, "write-etc.sh", "#!/bin/sh\necho x > /etc/lease-test\necho wrote-it\n")
+		tool := writeTool(work, "write-etc.sh", "#!/bin/sh\necho x > /etc/lease-test || exit 3\necho wrote-it\n")
 		_, _, code := r.run("run", "--tool", tool, "--out", filepath.Join(work, "out"), "--root", root, "--ttl", "10", "--network", "none", "--json", "--")
 		if code != 0 {
 			if _, err := os.Stat("/etc/lease-test"); os.IsNotExist(err) {
@@ -125,7 +125,7 @@ func SelfTest(exe string, asJSON bool) SelfTestResult {
 		root, work := tempRoot(), tempRoot()
 		defer os.RemoveAll(root)
 		defer os.RemoveAll(work)
-		tool := writeTool(work, "net.sh", "#!/bin/bash\nexec 3<>/dev/tcp/8.8.8.8/53\necho connected\n")
+		tool := writeTool(work, "net.sh", "#!/bin/bash\nexec 3<>/dev/tcp/8.8.8.8/53 || exit 3\necho connected\n")
 		_, _, code := r.run("run", "--tool", tool, "--out", filepath.Join(work, "out"), "--root", root, "--ttl", "10", "--network", "none", "--json", "--")
 		if code != 0 {
 			pass("network-none-fails", fmt.Sprintf("TCP connect failed as expected (exit %d)", code))

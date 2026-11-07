@@ -109,100 +109,127 @@ func Run(o RunOptions) (RunResult, int) {
 	leasePath := filepath.Join(leaseDir, "lease.json")
 	_ = writeLeaseJSON(leasePath, lease)
 
-	bwrapArgs := buildBwrapArgs(o, leaseDir, toolAbs, inputsAbs, id)
 	useSystemd := systemdAvailable()
-	var outer []string
-	if useSystemd {
-		lease.Systemd = true
-		outer = buildSystemdArgs(o, id, bwrapArgs)
-	} else {
-		lease.Systemd = false
+	lease.Systemd = useSystemd
+	if !useSystemd {
 		lease.SystemdReason = "systemd-run --user --scope could not start (no user bus in this environment); ran bwrap directly with lease-enforced TTL"
-		outer = append([]string{"bwrap"}, bwrapArgs...)
 	}
 	_ = writeLeaseJSON(leasePath, lease)
 
 	stdoutPath := filepath.Join(leaseDir, "stdout.log")
 	stderrPath := filepath.Join(leaseDir, "stderr.log")
-	stdoutFile, err := os.Create(stdoutPath)
-	if err != nil {
-		return fail("OUTPUT_ERROR", fmt.Sprintf("cannot create stdout log: %v", err), "Pass a writable --root.", "Check permissions on --root.", 3)
-	}
-	defer stdoutFile.Close()
-	stderrFile, err := os.Create(stderrPath)
-	if err != nil {
-		return fail("OUTPUT_ERROR", fmt.Sprintf("cannot create stderr log: %v", err), "Pass a writable --root.", "Check permissions on --root.", 3)
-	}
-	defer stderrFile.Close()
-	outW := &cappedWriter{f: stdoutFile, limit: MaxLogBytes}
-	errW := &cappedWriter{f: stderrFile, limit: MaxLogBytes}
 
-	// Lease-enforced TTL: systemd RuntimeMaxSec is the backup, the lease's
-	// own context is what reports timed_out deterministically.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.TTL)*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, outer[0], outer[1:]...)
-	cmd.Stdout = outW
-	cmd.Stderr = errW
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Inherit a minimal environment for the outer launcher only; the child
-	// environment is set by bwrap --clearenv/--setenv.
-	cmd.Env = os.Environ()
-	if err := cmd.Start(); err != nil {
-		return fail("LEASE_NOT_STARTED", fmt.Sprintf("could not start the sandbox: %v", err), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
-	}
-	lease.PID = cmd.Process.Pid
-	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-		lease.PGID = pgid
-	} else {
-		lease.PGID = cmd.Process.Pid
-	}
-	_ = writeLeaseJSON(leasePath, lease)
+	// execute runs one attempt. It (re)creates the log files, so a retry
+	// starts with clean logs.
+	execute := func(useProc bool) (exitCode int, signal string, timedOut bool, peakKB int64, duration time.Duration, outputBytes int64, startErr error) {
+		bwrapArgs := buildBwrapArgs(o, leaseDir, toolAbs, inputsAbs, id, useProc)
+		var outer []string
+		if useSystemd {
+			outer = buildSystemdArgs(o, id, bwrapArgs)
+		} else {
+			outer = append([]string{"bwrap"}, bwrapArgs...)
+		}
+		stdoutFile, err := os.Create(stdoutPath)
+		if err != nil {
+			return 0, "", false, 0, 0, 0, fmt.Errorf("cannot create stdout log: %w", err)
+		}
+		stderrFile, err := os.Create(stderrPath)
+		if err != nil {
+			stdoutFile.Close()
+			return 0, "", false, 0, 0, 0, fmt.Errorf("cannot create stderr log: %w", err)
+		}
+		outW := &cappedWriter{f: stdoutFile, limit: MaxLogBytes}
+		errW := &cappedWriter{f: stderrFile, limit: MaxLogBytes}
 
-	waitErr := cmd.Wait()
-	duration := time.Since(start)
-	timedOut := ctx.Err() == context.DeadlineExceeded
-	if timedOut {
-		KillGroup(lease.PGID)
-	}
-	// Make sure nothing in the group survives.
-	if waitErr == nil && !timedOut {
-		// Child exited on its own; still sweep the group.
-		KillGroup(lease.PGID)
-	}
+		// Lease-enforced TTL: systemd RuntimeMaxSec is the backup, the
+		// lease's own context is what reports timed_out deterministically.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.TTL)*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, outer[0], outer[1:]...)
+		cmd.Stdout = outW
+		cmd.Stderr = errW
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		// Inherit the environment for the outer launcher only; the child
+		// environment is set by bwrap --clearenv/--setenv.
+		cmd.Env = os.Environ()
+		if err := cmd.Start(); err != nil {
+			stdoutFile.Close()
+			stderrFile.Close()
+			return 0, "", false, 0, 0, 0, fmt.Errorf("could not start the sandbox: %w", err)
+		}
+		lease.PID = cmd.Process.Pid
+		if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+			lease.PGID = pgid
+		} else {
+			lease.PGID = cmd.Process.Pid
+		}
+		_ = writeLeaseJSON(leasePath, lease)
 
-	exitCode := 0
-	signal := ""
-	if waitErr != nil {
-		if ee, ok := waitErr.(*exec.ExitError); ok {
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
-				if ws.Signaled() {
-					signal = ws.Signal().String()
-					exitCode = -1
+		waitErr := cmd.Wait()
+		duration = time.Since(start)
+		timedOut = ctx.Err() == context.DeadlineExceeded
+		if timedOut {
+			KillGroup(lease.PGID)
+		} else if waitErr == nil {
+			// Child exited on its own; still sweep the group.
+			KillGroup(lease.PGID)
+		}
+
+		exitCode = 0
+		if waitErr != nil {
+			if ee, ok := waitErr.(*exec.ExitError); ok {
+				if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
+					if ws.Signaled() {
+						signal = ws.Signal().String()
+						exitCode = -1
+					} else {
+						exitCode = ws.ExitStatus()
+					}
 				} else {
-					exitCode = ws.ExitStatus()
+					exitCode = 1
 				}
 			} else {
 				exitCode = 1
 			}
-		} else {
-			exitCode = 1
+		}
+		// systemd RuntimeMaxSec can kill the scope at the TTL even if our
+		// context fired a moment later; treat "ran for ~TTL and died by
+		// signal" as a timeout.
+		if !timedOut && signal != "" && duration >= time.Duration(o.TTL)*time.Second-time.Second {
+			timedOut = true
+		}
+		// Peak memory: rusage of the launcher is only meaningful on the
+		// direct bwrap path; report it when available, 0 otherwise.
+		if ps := cmd.ProcessState; ps != nil {
+			if ru, ok := ps.Sys().(*syscall.Rusage); ok {
+				peakKB = ru.Maxrss // KB on Linux
+			}
+		}
+		outputBytes = outW.written + errW.written
+		stdoutFile.Close()
+		stderrFile.Close()
+		return exitCode, signal, timedOut, peakKB, duration, outputBytes, nil
+	}
+
+	exitCode, signal, timedOut, peakKB, duration, outputBytes, startErr := execute(true)
+	if startErr != nil {
+		return fail("LEASE_NOT_STARTED", startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
+	}
+	// Mounting a fresh proc is impossible on some hosts (this cloud VM
+	// included): bwrap fails fast with "Can't mount proc". Retry once
+	// with an empty /proc directory instead of a proc mount.
+	if exitCode != 0 && !timedOut {
+		if b, err := os.ReadFile(stderrPath); err == nil && strings.Contains(string(b), "Can't mount proc") {
+			lease.ProcFallback = true
+			lease.ProcReason = "mounting a fresh /proc is not permitted on this host; the sandbox uses an empty /proc instead"
+			_ = writeLeaseJSON(leasePath, lease)
+			exitCode, signal, timedOut, peakKB, duration, outputBytes, startErr = execute(false)
+			if startErr != nil {
+				return fail("LEASE_NOT_STARTED", startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
+			}
 		}
 	}
-	// systemd RuntimeMaxSec can kill the scope at the TTL even if our
-	// context fired a moment later; treat "ran for ~TTL and died by
-	// signal" as a timeout.
-	if !timedOut && signal != "" && duration >= time.Duration(o.TTL)*time.Second-time.Second {
-		timedOut = true
-	}
-	// Peak memory: rusage of the launcher is only meaningful on the direct
-	// bwrap path; report it when available, 0 otherwise.
-	var peakKB int64
-	if ps := cmd.ProcessState; ps != nil {
-		if ru, ok := ps.Sys().(*syscall.Rusage); ok {
-			peakKB = ru.Maxrss // KB on Linux
-		}
-	}
+
 	lease.Ended = time.Now()
 	lease.TimedOut = timedOut
 	lease.Signal = signal
@@ -219,7 +246,6 @@ func Run(o RunOptions) (RunResult, int) {
 		return fail("OUTPUT_ERROR", fmt.Sprintf("cannot copy sandbox output to --out: %v", err), "Check that --out is writable.", "Re-run with a different --out.", 3)
 	}
 
-	outputBytes := outW.written + errW.written
 	res := RunResult{
 		Lease: id, ExitCode: exitCode, Signal: signal, Out: outAbs,
 		Stdout: stdoutPath, Stderr: stderrPath,

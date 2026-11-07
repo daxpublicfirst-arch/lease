@@ -25,7 +25,7 @@ func TestNewIDFormat(t *testing.T) {
 
 func TestBwrapArgsBindsToolAndInputs(t *testing.T) {
 	o := RunOptions{Tool: "/tmp/tool", Inputs: []string{"/tmp/in.log"}, Out: "/tmp/out", Root: "/tmp/root", TTL: 60, Memory: "2G", CPUs: 2, Network: "none", Argv: []string{"a", "b"}}
-	args := buildBwrapArgs(o, "/tmp/root/abc", "/tmp/tool", []string{"/tmp/in.log"}, "abc")
+	args := buildBwrapArgs(o, "/tmp/root/abc", "/tmp/tool", []string{"/tmp/in.log"}, "abc", true)
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"--ro-bind /usr /usr",
@@ -41,6 +41,9 @@ func TestBwrapArgsBindsToolAndInputs(t *testing.T) {
 			t.Errorf("bwrap args missing %q in %q", want, joined)
 		}
 	}
+	if !strings.Contains(joined, "--unshare-user") || !strings.Contains(joined, "--tmpfs /etc") {
+		t.Errorf("bwrap args must use --unshare-user and a tmpfs /etc: %q", joined)
+	}
 	if strings.Contains(joined, "--ro-bind /bin /bin") || strings.Contains(joined, "--ro-bind /lib /lib") {
 		t.Errorf("must not bind symlinked /bin or /lib separately: %q", joined)
 	}
@@ -51,7 +54,7 @@ func TestBwrapArgsBindsToolAndInputs(t *testing.T) {
 
 func TestBwrapArgsLocalhostBringsLoopbackUp(t *testing.T) {
 	o := RunOptions{Network: "localhost", TTL: 60, Memory: "2G", CPUs: 2}
-	args := buildBwrapArgs(o, "/tmp/root/abc", "/tmp/tool", nil, "abc")
+	args := buildBwrapArgs(o, "/tmp/root/abc", "/tmp/tool", nil, "abc", true)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "ip link set lo up") {
 		t.Errorf("localhost mode must bring lo up: %q", joined)
@@ -124,5 +127,17 @@ func TestErrorJSONShape(t *testing.T) {
 	}
 	if f.Error.Code != "BWRAP_MISSING" || f.Error.Fix == "" || f.Error.IfThatFails == "" {
 		t.Fatalf("error object incomplete: %+v", f.Error)
+	}
+}
+
+func TestBwrapArgsProcFallback(t *testing.T) {
+	o := RunOptions{Network: "none", TTL: 60, Memory: "2G", CPUs: 2}
+	withProc := strings.Join(buildBwrapArgs(o, "/tmp/root/abc", "/tmp/tool", nil, "abc", true), " ")
+	if !strings.Contains(withProc, "--proc /proc") {
+		t.Errorf("useProc=true must mount a fresh proc: %q", withProc)
+	}
+	withoutProc := strings.Join(buildBwrapArgs(o, "/tmp/root/abc", "/tmp/tool", nil, "abc", false), " ")
+	if !strings.Contains(withoutProc, "--dir /proc") || strings.Contains(withoutProc, "--proc /proc") {
+		t.Errorf("useProc=false must use an empty /proc dir: %q", withoutProc)
 	}
 }

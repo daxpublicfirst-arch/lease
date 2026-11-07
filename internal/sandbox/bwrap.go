@@ -46,9 +46,17 @@ type RunResult struct {
 //   - The spec's bwrap list never binds --tool, so the child could not exec
 //     it at all. We bind the tool read-only at /tool and exec that.
 //   - /etc is created with --dir (writable), so a child could create
-//     /etc/lease-test. We --remount-ro /etc and / after the binds, while
-//     /out, /home, /tmp and /run stay writable because they are mounts.
-func buildBwrapArgs(o RunOptions, leaseDir, toolAbs string, inputsAbs []string, id string) []string {
+//     /etc/lease-test. We mount a tmpfs on /etc, bind the minimal files
+//     into it, and --remount-ro /etc (a plain --dir cannot be remounted).
+//   - --unshare-user --uid 0 --gid 0 (bwrap's portable rootless mode):
+//     without it, loopback setup fails in this VM ("Failed RTM_NEWADDR:
+//     No child processes") because the container lacks CAP_NET_ADMIN.
+//   - useProc selects --proc /proc (spec) or --dir /proc (empty). Mounting
+//     a fresh proc is impossible in this VM (even plain
+//     `unshare --user --map-root-user --pid --mount-proc` fails with
+//     EPERM), so Run retries with an empty /proc when the first attempt
+//     fails that way. The child sees no host processes either way.
+func buildBwrapArgs(o RunOptions, leaseDir, toolAbs string, inputsAbs []string, id string, useProc bool) []string {
 	leaseOut := filepath.Join(leaseDir, "out")
 	leaseHome := filepath.Join(leaseDir, "home")
 	chdir := "/out"
@@ -58,11 +66,12 @@ func buildBwrapArgs(o RunOptions, leaseDir, toolAbs string, inputsAbs []string, 
 		}
 	}
 	args := []string{
+		"--unshare-user", "--uid", "0", "--gid", "0",
 		"--ro-bind", "/usr", "/usr",
 		"--symlink", "usr/bin", "/bin",
 		"--symlink", "usr/lib", "/lib",
 		"--symlink", "usr/lib64", "/lib64",
-		"--dir", "/etc",
+		"--tmpfs", "/etc",
 		"--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
 		"--ro-bind-try", "/etc/ssl", "/etc/ssl",
 		"--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
@@ -72,12 +81,21 @@ func buildBwrapArgs(o RunOptions, leaseDir, toolAbs string, inputsAbs []string, 
 	for i, in := range inputsAbs {
 		args = append(args, "--ro-bind", in, fmt.Sprintf("/input/%d", i))
 	}
+	// The tool bind must come BEFORE --remount-ro / below: once / is
+	// remounted read-only, bwrap cannot create the /tool mount point.
+	args = append(args, "--ro-bind", toolAbs, "/tool")
 	args = append(args,
 		"--bind", leaseOut, "/out",
 		"--bind", leaseHome, "/home",
 		"--tmpfs", "/tmp",
 		"--tmpfs", "/run",
-		"--proc", "/proc",
+	)
+	if useProc {
+		args = append(args, "--proc", "/proc")
+	} else {
+		args = append(args, "--dir", "/proc")
+	}
+	args = append(args,
 		"--dev", "/dev",
 		"--unshare-pid",
 		"--unshare-net",
@@ -101,13 +119,21 @@ func buildBwrapArgs(o RunOptions, leaseDir, toolAbs string, inputsAbs []string, 
 		}
 	}
 	args = append(args, "--chdir", chdir)
-	args = append(args, "--ro-bind", toolAbs, "/tool")
+	// Exec form: an executable tool runs directly; a non-executable one
+	// (e.g. a shell script checked in without the exec bit, which the
+	// GitHub API stores as 0644) runs under /bin/sh instead of failing
+	// with EACCES.
+	execArgs := []string{"/tool"}
+	if st, err := os.Stat(toolAbs); err == nil && st.Mode()&0o111 == 0 {
+		execArgs = []string{"/bin/sh", "/tool"}
+	}
 	if o.Network == "localhost" {
 		// Loopback-only: the net namespace is unshared, so bring lo up
 		// with the ip binary that /usr provides, then exec the tool.
-		args = append(args, "/bin/sh", "-c", "ip link set lo up 2>/dev/null || true; exec \"$@\"", "sh", "/tool")
+		args = append(args, "/bin/sh", "-c", "ip link set lo up 2>/dev/null || true; exec \"$@\"", "sh")
+		args = append(args, execArgs...)
 	} else {
-		args = append(args, "/tool")
+		args = append(args, execArgs...)
 	}
 	args = append(args, o.Argv...)
 	return args
