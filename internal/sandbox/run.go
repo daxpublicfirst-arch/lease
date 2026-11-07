@@ -23,6 +23,7 @@ type execOutcome struct {
 	duration                         time.Duration
 	outputBytes                      int64
 	stdoutTruncated, stderrTruncated bool
+	logErr                           error
 	startErr                         error
 }
 
@@ -246,6 +247,11 @@ func Run(o RunOptions) (RunResult, int) {
 		out.outputBytes = outW.written + errW.written
 		out.stdoutTruncated = outW.truncated
 		out.stderrTruncated = errW.truncated
+		if outW.writeErr != nil {
+			out.logErr = fmt.Errorf("cannot write stdout log: %w", outW.writeErr)
+		} else if errW.writeErr != nil {
+			out.logErr = fmt.Errorf("cannot write stderr log: %w", errW.writeErr)
+		}
 		stdoutFile.Close()
 		stderrFile.Close()
 		return out
@@ -254,6 +260,9 @@ func Run(o RunOptions) (RunResult, int) {
 	out := execute(true)
 	if out.startErr != nil {
 		return fail("LEASE_NOT_STARTED", out.startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
+	}
+	if out.logErr != nil {
+		return fail("OUTPUT_ERROR", out.logErr.Error(), "Free disk space under --root or pass a --root on a larger disk.", "Check the disk where --root lives.", 3)
 	}
 	// Mounting a fresh proc is impossible on some hosts (this cloud VM
 	// included): bwrap fails fast with "Can't mount proc". Retry once
@@ -266,6 +275,9 @@ func Run(o RunOptions) (RunResult, int) {
 			out = execute(false)
 			if out.startErr != nil {
 				return fail("LEASE_NOT_STARTED", out.startErr.Error(), "Run `lease doctor` and fix what it reports.", "Check bwrap and systemd-run are installed and user namespaces are enabled.", 3)
+			}
+			if out.logErr != nil {
+				return fail("OUTPUT_ERROR", out.logErr.Error(), "Free disk space under --root or pass a --root on a larger disk.", "Check the disk where --root lives.", 3)
 			}
 		}
 	}

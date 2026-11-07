@@ -155,12 +155,16 @@ func KillGroup(pgid int) {
 }
 
 // cappedWriter writes to a file but stops after limit bytes and records
-// whether anything was truncated.
+// whether anything was truncated. It also records the first underlying
+// write error (e.g. disk full): without this, a failed log write makes
+// the child die with SIGPIPE and lease would blame the child (CHILD_EXIT
+// 141) for what is really a host-side output failure.
 type cappedWriter struct {
 	f         *os.File
 	limit     int64
 	written   int64
 	truncated bool
+	writeErr  error
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
@@ -175,6 +179,9 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.f.Write(p)
 	w.written += int64(n)
+	if err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
 	return len(p), err
 }
 

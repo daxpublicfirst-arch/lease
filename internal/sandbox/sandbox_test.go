@@ -145,6 +145,29 @@ func TestCappedWriterTruncates(t *testing.T) {
 	}
 }
 
+func TestCappedWriterRecordsWriteError(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.Name()
+	f.Close()
+	// Close the file, then write through the writer: the underlying
+	// write must fail and be recorded instead of blamed on the child.
+	f2, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2.Close()
+	w := &cappedWriter{f: f2, limit: 1024}
+	if _, err := w.Write([]byte("hello")); err == nil {
+		t.Fatalf("write to a closed file must return an error")
+	}
+	if w.writeErr == nil {
+		t.Fatalf("writer must record the underlying write error")
+	}
+}
+
 func TestGCNeverRemovesYoungLease(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "young")
